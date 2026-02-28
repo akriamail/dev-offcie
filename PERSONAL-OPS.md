@@ -155,6 +155,65 @@ sudo journalctl -u autossh-admin -f
 - Mac 侧从 `~/.zshrc` 移除 `kuse` 函数定义并 `source ~/.zshrc`。
 - admin 侧从 `/root/.ssh/authorized_keys` 删除对应公钥 `mac-to-admin`。
 
+### 2026-02-28 gw 透明代理（二阶段预备）
+
+- 日期时间（UTC+8）:
+- 2026-02-28 01:30 - 02:30
+- 变更:
+- 在 `gw(192.168.1.100)` 从 `master:/tmp/sing-box.tar.gz` 安装 `sing-box 1.12.22` 到 `/usr/local/bin/sing-box`。
+- 首轮 VMess 配置出现 `EOF`，定位为参数源不一致（手填 UUID 与订阅解码 UUID 不一致）。
+- 改为以 `vmess://` 解码后的真实参数:
+- `server=hk2.changuoo.com`
+- `port=35476`
+- `uuid=4a94f283-5ca4-4397-81a4-ac3252412346`
+- `net=tcp`
+- `tls=true`
+- `alpn=h2,http/1.1`
+- 在 `gw` 保留 `mixed` 入站 `127.0.0.1:17890` 作为联通验证口。
+- 验证:
+- `curl -x http://127.0.0.1:17890 https://api.ipify.org` 返回 `38.47.106.216`（HK 出口）。
+- `curl -x http://127.0.0.1:17890 -I https://registry.k8s.io/v2/` 返回 `200`。
+- `curl -x http://127.0.0.1:17890 -I https://registry-1.docker.io/v2/` 返回 `401`（registry 可达正常响应）。
+- `gw -> hk2.changuoo.com:35476` TCP/TLS 连通验证通过（`openssl s_client`）。
+- 当前状态:
+- 仅完成 `gw` 代理联通验证，尚未启用透明代理规则（redirect/tproxy）。
+- 尚未修改 `master/worker` 默认网关，集群现有管理方式保持不变。
+- 下次继续:
+- 在 `gw` 落地 `ipset + iptables + sing-box redirect/tproxy`（仅匹配三台节点源 IP）。
+- 按 `worker -> worker -> master` 灰度切换默认网关到 `192.168.1.100`，每台切换后立即验收并具备回滚。
+- 回滚点:
+- 恢复 `sing-box` 旧配置备份: `/etc/sing-box/config.json.bak.*`。
+- 停止 `sing-box`: `systemctl stop sing-box`（保底隔离故障）。
+- 节点网关改动阶段如失败，单机回滚为原默认网关。
+
+### 2026-02-28 gw 透明代理（二阶段执行到切换前）
+
+- 日期时间（UTC+8）:
+- 2026-02-28 02:30 - 02:45
+- 变更:
+- 在 `gw` 安装并启用 `ipset`。
+- 开启转发 `net.ipv4.ip_forward=1` 并写入 `/etc/sysctl.d/99-gw-forward.conf`。
+- 创建 `ipset k3s_nodes` 并写入三台节点源 IP:
+- `183.168.1.240`、`183.168.1.241`、`183.168.1.242`。
+- 创建并下发 `iptables nat` 规则链 `K3S_PROXY`，放行:
+- `10.0.0.0/8`、`172.16.0.0/12`、`183.168.1.0/24`、`127.0.0.0/8`、`39.107.113.26/32`。
+- 将 `PREROUTING` 挂接到 `-m set --match-set k3s_nodes src -j K3S_PROXY`。
+- 验证:
+- `curl -x http://127.0.0.1:17890 -I https://registry.k8s.io/v2/` 返回 `200`。
+- `curl -x http://127.0.0.1:17890 -I https://registry-1.docker.io/v2/` 返回 `401`（可达正常）。
+- `ipset list k3s_nodes` 与 `iptables -t nat -S` 输出符合预期。
+- 补充说明:
+- 在 `admin` 上直接访问 `127.0.0.1:17890` 失败属预期（该端口位于 `gw` 本机回环）。
+- 当前状态:
+- 透明代理规则已在 `gw` 生效，下一步为节点灰度切换默认网关。
+- 尚未执行 `worker/master` 默认网关变更。
+- 下次继续（第一步）:
+- 先切 `worker1` 默认网关到 `gw`（按实际网段地址），验证通过后再切 `worker2`，最后 `master`。
+- 回滚点:
+- 删除 `PREROUTING -> K3S_PROXY` 规则并清空链。
+- 销毁 `ipset k3s_nodes`。
+- 节点侧默认网关回滚为切换前记录值。
+
 ### 日志模板（复制追加）
 
 - 日期时间（UTC+8）:
