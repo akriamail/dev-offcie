@@ -214,6 +214,39 @@ sudo journalctl -u autossh-admin -f
 - 销毁 `ipset k3s_nodes`。
 - 节点侧默认网关回滚为切换前记录值。
 
+### 2026-03-04 dev 集群镜像拉取失败修复（DNS 劫持绕过）
+
+- 日期时间（UTC+8）:
+- 2026-03-04 00:30 - 01:30
+- 变更:
+- 确认 dev 集群 `ImagePullBackOff` 根因是 DNS 劫持导致 `registry-1.docker.io` 解析异常与 TLS 失败。
+- 在 `gw` 修正 `sing-box` 配置内网段：`183.168.1.0/24` -> `192.168.1.0/24`。
+- 在 `gw` 安装 `dnscrypt-proxy` 与 `dnsmasq`：
+- `dnscrypt-proxy` 监听 `127.0.0.1:5053`，通过本机 `socks5://127.0.0.1:17890` 走 HK 出口（DoH）。
+- `dnsmasq` 监听 `192.168.1.100:53`，上游指向 `127.0.0.1#5053`。
+- 在 `gw` 加入 `iptables nat` 规则，将来自 `k3s_nodes` 的 UDP/53 重定向到本机 53。
+- 在 `master/worker03` 禁用 IPv6（`/etc/sysctl.d/99-disable-ipv6.conf`），并将 DNS 指向 `192.168.1.100`（`resolvectl dns ens160 192.168.1.100`）。
+- 验证:
+- `gw` 上 `dig @127.0.0.1 -p 5053 registry-1.docker.io` 返回 AWS IP 段。
+- `master/worker03` 上 `getent ahosts registry-1.docker.io` 返回 AWS IP 段。
+- `crictl pull docker.io/rancher/mirrored-pause:3.6` 成功。
+- 回滚点:
+- `gw` 删除 UDP/53 重定向规则，停用 `dnsmasq` 与 `dnscrypt-proxy`。
+- `master/worker` 撤销 `resolvectl dns` 改动并移除 `99-disable-ipv6.conf`。
+
+### 2026-03-04 gw 持久化补全
+
+- 日期时间（UTC+8）:
+- 2026-03-04 01:40 - 01:50
+- 变更:
+- 确认 `sing-box`/`dnsmasq`/`dnscrypt-proxy`/`netfilter-persistent` 均为 `enabled`。
+- 保存当前 `iptables` 规则到 `/etc/iptables/rules.v4`（包含 UDP/53 重定向与 `K3S_PROXY`）。
+- 清理重复的 `TCPMSS` 规则后重新保存规则文件。
+- 验证:
+- `iptables-save | grep -E 'K3S_PROXY|dport 53'` 包含 `-A PREROUTING -p udp --dport 53 ... --to-ports 53`。
+- 回滚点:
+- 从备份恢复 `/etc/iptables/rules.v4`（如有）。
+
 ### 日志模板（复制追加）
 
 - 日期时间（UTC+8）:

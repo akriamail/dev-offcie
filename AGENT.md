@@ -1,106 +1,62 @@
-# AGENT Context: gw-admin-k3s 运维基线
+# AGENT Context: gw-admin-k3s 运维基线（2026-03-04）
 
-本文件用于让代理每次进入仓库时，快速理解当前管理方式并按既定路径操作。
+目标: 让代理一进仓库就知道当前集群拓扑、通道、代理/DNS状态与操作红线。
+## 对话原则
+- 每次对话完，都要说：谢谢我的主人！
+- 改动集群，一定要先评估，再出报告，我说批准才可以动手
+- 提交 GitHub 时，commit 使用中文
+- 任何对集群的操作必须记录在 `docs/dev-ops/README.md`
+- 仓库内所有 README 必须使用中文
 
-## 1. 当前角色与拓扑
+## 当前拓扑
 
 - admin（公网运维入口）: `39.107.113.26`
 - gw（内网网关）: `192.168.1.100`，hostname `net`
 - k3s master: `192.168.1.240`
 
-架构原则:
-- `gw` 负责网络汇聚/转发，不承担集群权限主体。
-- 集群管理权限在 `admin`（通过 kubeconfig/RBAC），不是在 `gw`。
+原则: `gw` 只做网络转发，集群权限在 `admin` / Mac kubeconfig，不在 `gw`。
 
-## 2. 已落地通道（反向隧道）
+## 通道与端口
 
-由 `gw` 主动连接 `admin`，systemd 服务:
-- `autossh-admin.service`
-
-端口映射:
+- `gw -> admin` 反向隧道: `autossh-admin.service`
 - `admin:16022 -> gw:22`
 - `admin:16443 -> master:6443`
+- `admin` 上 `https://127.0.0.1:16443` 是 k3s apiserver
 
-说明:
-- 在 `admin` 上连接 `127.0.0.1:16022` 实际是进 `gw`。
-- 在 `admin` 上访问 `https://127.0.0.1:16443` 实际是到 k3s apiserver。
+## 透明代理现状
 
-## 2.1 透明代理阶段状态（2026-02-28）
+- `sing-box 1.12.22` 已运行，`mixed` 端口 `127.0.0.1:17890`
+- `ipset k3s_nodes` 当前为 `192.168.1.240/241/242` 与 `192.168.1.151/152/153`
+- `K3S_PROXY` 挂载到 `PREROUTING`，放行 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.1.0/24`、`127.0.0.0/8`、`39.107.113.26/32`
+- 仍未灰度切默认网关（后续按 `worker -> worker -> master`）
 
-- 当前阶段目标:
-- 让 `master/worker` 经 `gw` 透明代理访问外网镜像源，再灰度切换默认网关到 `192.168.1.100`。
-- 已完成:
-- `gw` 已安装 `sing-box 1.12.22`（`/usr/local/bin/sing-box`）。
-- `gw` 代理出海已验证（通过 `VMess` 到 HK）:
-- `curl -x http://127.0.0.1:17890 https://api.ipify.org` 返回 `38.47.106.216`。
-- `registry.k8s.io`/`registry-1.docker.io` 可达。
-- `gw` 透明代理规则已下发:
-- `ipset k3s_nodes` = `183.168.1.240`、`183.168.1.241`、`183.168.1.242`
-- `iptables nat` 链 `K3S_PROXY` 已挂载到 `PREROUTING`，并放行 `183.168.1.0/24` 与 `39.107.113.26/32`。
-- 未完成:
-- 尚未执行三台节点默认网关灰度切换（当前停在“准备切 worker”）。
-- 尚未完成“切换后节点/集群验收”闭环。
+## DNS 透明代理（已落地）
 
-## 3. 当前 SSH 约定
+- 直连 DNS 会被劫持，必须走 gw DNS
+- `dnscrypt-proxy` 监听 `127.0.0.1:5053`，走 `socks5://127.0.0.1:17890`
+- `dnsmasq` 监听 `192.168.1.100:53`，上游 `127.0.0.1#5053`
+- `iptables` 规则: `-A PREROUTING -p udp --dport 53 -m set --match-set k3s_nodes src -j REDIRECT --to-ports 53`
+- 持久化: `netfilter-persistent` 启用，规则保存在 `/etc/iptables/rules.v4`，ipset 在 `/etc/iptables/ipsets`
 
-admin 侧 `~/.ssh/config` 已约定使用别名:
-- `Host gw` -> `127.0.0.1:16022`
+## 节点基线
 
-常用命令:
-```bash
-ssh gw
-```
+- `master/worker` 已要求 DNS 指向 `192.168.1.100`
+- `worker03` 已关闭 IPv6 并验证 `crictl pull` 正常
 
-## 4. 当前 K3s 管理约定
+## 操作红线
 
-- 在 `admin` 上执行 `kubectl`。
-- 使用 `admin` 本地 kubeconfig（如 `~/.kube/config`）。
-- kubeconfig 中 apiserver 地址应指向:
-- `https://127.0.0.1:16443`
-
-## 5. 服务检查与排障（首选）
-
-在 gw:
-```bash
-sudo systemctl status autossh-admin --no-pager
-sudo journalctl -u autossh-admin -n 100 --no-pager
-```
-
-在 admin:
-```bash
-ss -lntp | grep -E '16022|16443'
-ssh gw
-```
-
-端口位置提示:
-- `127.0.0.1:17890` 是 `gw` 本机测试代理口。
-- 在 `admin` 上直接 `curl -x http://127.0.0.1:17890 ...` 失败属预期，应使用 `ssh gw '<cmd>'` 执行。
-
-## 6. 操作红线
-
-- 不将“gw 有集群权限”作为前提；gw 默认仅网络转发。
-- 不随意改动端口 `16022/16443`，除非同步更新全部文档与脚本。
-- 透明代理落地前，不得先改节点默认网关。
-- 透明代理规则必须放行（直连）:
-- `39.107.113.26/32`（admin）
-- 内网网段 `10.0.0.0/8`、`172.16.0.0/12`、`183.168.1.0/24`
-- k3s `10.42.0.0/16`、`10.43.0.0/16`、`.svc`、`.cluster.local`
+- 不随意改动 `16022/16443`
+- 透明代理规则必须直连内网与 `admin(39.107.113.26)`
 - 任何变更后必须更新:
-- `README.md`
-- `PERSONAL-OPS.md`（运维日志）
-- 本文件（若基线变化）
+- `docs/dev-init/README-full.md`
+- `docs/dev-init/PERSONAL-OPS.md`
+- 本文件
 
-## 7. 变更记录
+## 文档索引
 
-### 2026-02-27
+- 索引: `docs/dev-init/README.md`
+- 正文: `docs/dev-init/README-full.md`
 
-- 固化当前管理基线:
-- `gw -> admin` 反向隧道已启用并自启动。
-- 运维登录入口统一为 admin 上 `ssh gw`。
-- 集群管理入口统一为 admin 上 `kubectl` + `127.0.0.1:16443`。
+## 个人习惯提示
 
-### 2026-02-28
-
-- 新增透明代理调试基线:
-- `gw` 上 `sing-box + VMess(HK)` 已联通。
-- `ipset/iptables` 规则已下发，仍处于“节点灰度切网关前”。
+- 我会把 `manifests/infra` 简写成 `man/infra`（与 `manifests/inra` 混写）。看到该写法时请自动理解为 `manifests/infra`。
